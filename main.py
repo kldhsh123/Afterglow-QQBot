@@ -21,7 +21,7 @@ import signal
 import sys
 from pathlib import Path
 
-from afterglow_client import AfterglowClient, AfterglowError
+from afterglow_client import AfterglowClient, AfterglowError, HistoryCompressionConfig
 from qqbot import C2CMessage, QQBotAPI, QQBotGateway
 
 logger = logging.getLogger("afterglow.qqbot")
@@ -76,6 +76,34 @@ async def main() -> int:
     afterglow_timeout = float(os.environ.get("AFTERGLOW_TIMEOUT", "120"))
     silence_sentinel = os.environ.get("AFTERGLOW_SILENCE_SENTINEL", "[silent]")
     history_max_turns = int(os.environ.get("AFTERGLOW_HISTORY_MAX_TURNS", "6"))
+    history_db_raw = os.environ.get(
+        "AFTERGLOW_HISTORY_DB_PATH",
+        "data/chat_history.sqlite3",
+    )
+    history_db_path = Path(history_db_raw)
+    if not history_db_path.is_absolute():
+        history_db_path = Path(__file__).parent / history_db_path
+    history_compression = HistoryCompressionConfig(
+        api_key=os.environ.get("AFTERGLOW_HISTORY_COMPRESSION_API_KEY", "").strip(),
+        model=os.environ.get("AFTERGLOW_HISTORY_COMPRESSION_MODEL", "").strip(),
+        base_url=os.environ.get(
+            "AFTERGLOW_HISTORY_COMPRESSION_BASE_URL",
+            "https://api.openai.com",
+        ).strip(),
+        trigger_turns=int(
+            os.environ.get("AFTERGLOW_HISTORY_COMPRESSION_TRIGGER_TURNS", "0")
+        ),
+        trigger_tokens=int(
+            os.environ.get("AFTERGLOW_HISTORY_COMPRESSION_TRIGGER_TOKENS", "0")
+        ),
+        keep_turns=int(
+            os.environ.get("AFTERGLOW_HISTORY_COMPRESSION_KEEP_TURNS", "3")
+        ),
+        timeout=float(os.environ.get("AFTERGLOW_HISTORY_COMPRESSION_TIMEOUT", "60")),
+        max_output_tokens=int(
+            os.environ.get("AFTERGLOW_HISTORY_COMPRESSION_MAX_OUTPUT_TOKENS", "800")
+        ),
+    )
     error_reply = os.environ.get("AFTERGLOW_ERROR_REPLY", "").strip()
     allowed_openids = _parse_openid_set(
         os.environ.get("AFTERGLOW_ALLOWED_OPENIDS", "")
@@ -96,6 +124,8 @@ async def main() -> int:
         timeout=afterglow_timeout,
         silence_sentinel=silence_sentinel,
         history_max_turns=history_max_turns,
+        history_db_path=history_db_path,
+        history_compression=history_compression,
     )
 
     @gw.on_c2c_message
