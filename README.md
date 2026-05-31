@@ -2,7 +2,11 @@
 
 把 QQ 私聊接到本地 [Afterglow](https://github.com/kldhsh123/Afterglow) 后端：用户在 QQ 上私聊机器人，机器人把消息转给 Afterglow 的 `/v1/chat/completions`，再把回复发回 QQ。
 
-每个 QQ 用户在 Afterglow 后端视为一条独立会话（`conversation_id = qq:{user_openid}`）。客户端在内存里维护每个会话的最近 N 轮 user/assistant 消息，作为辅助上下文随请求一并发给后端；长期记忆仍由 Afterglow 后端通过 LanceDB 持久化。
+每个 QQ 用户在 Afterglow 后端视为一条独立会话（`conversation_id = qq:{user_openid}`）。客户端在本地 SQLite 文件里维护每个会话的最近 N 轮 user/assistant 消息，作为辅助上下文随请求一并发给后端；长期记忆仍由 Afterglow 后端通过 LanceDB 持久化。
+
+如果配置了聊天历史压缩，客户端会在本地历史达到指定轮数或估算 token 阈值时，通过 OpenAI Chat Completions 兼容接口生成摘要，并保留最近几轮原文继续对话。
+
+未启用压缩时，`AFTERGLOW_HISTORY_MAX_TURNS` 是本地短期历史硬上限；启用压缩后，原始历史会保留到压缩阈值，再替换为"摘要 + 最近 N 轮原文"。
 
 ---
 
@@ -76,6 +80,15 @@ python main.py
 | `AFTERGLOW_TIMEOUT` | ❌ | `120` | 单次请求超时（秒） |
 | `AFTERGLOW_SILENCE_SENTINEL` | ❌ | `[silent]` | 与后端 `SILENCE_RESPONSE_SENTINEL` 保持一致 |
 | `AFTERGLOW_HISTORY_MAX_TURNS` | ❌ | `6` | 客户端在 messages 数组里携带的最近轮数（一轮 = user+assistant）；`0` = 不携带 |
+| `AFTERGLOW_HISTORY_DB_PATH` | ❌ | `data/chat_history.sqlite3` | 本地短期聊天记录 SQLite 路径；相对路径按项目目录解析 |
+| `AFTERGLOW_HISTORY_COMPRESSION_API_KEY` | ❌ | （空） | 历史压缩使用的 OpenAI-compatible API key；留空禁用压缩 |
+| `AFTERGLOW_HISTORY_COMPRESSION_BASE_URL` | ❌ | `https://api.openai.com` | 历史压缩 API 地址，支持 `/v1/chat/completions` 兼容服务 |
+| `AFTERGLOW_HISTORY_COMPRESSION_MODEL` | ❌ | （空） | 历史压缩模型；留空禁用压缩 |
+| `AFTERGLOW_HISTORY_COMPRESSION_TRIGGER_TURNS` | ❌ | `0` | 达到多少轮 user+assistant 后压缩；`0` = 不按轮数触发 |
+| `AFTERGLOW_HISTORY_COMPRESSION_TRIGGER_TOKENS` | ❌ | `0` | 达到多少估算 token 后压缩；`0` = 不按 token 触发 |
+| `AFTERGLOW_HISTORY_COMPRESSION_KEEP_TURNS` | ❌ | `3` | 每次压缩后保留最近多少轮原文 |
+| `AFTERGLOW_HISTORY_COMPRESSION_TIMEOUT` | ❌ | `60` | 历史压缩 API 请求超时（秒） |
+| `AFTERGLOW_HISTORY_COMPRESSION_MAX_OUTPUT_TOKENS` | ❌ | `800` | 摘要最大输出 token |
 | `AFTERGLOW_ERROR_REPLY` | ❌ | （空） | 调用失败时的兜底回复；留空则不回（更接近真人"没动静"） |
 | `AFTERGLOW_ALLOWED_OPENIDS` | ❌ | （空） | 逗号分隔的 user_openid 白名单；留空 = 任何人都能触发（启动时会 warning） |
 | `AFTERGLOW_DENIED_REPLY` | ❌ | （空） | 非白名单用户的回复；留空 = 静默丢弃（不暴露机器人存在） |
