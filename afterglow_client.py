@@ -1,7 +1,8 @@
 """Afterglow OpenAI 兼容 API 客户端（仅 chat completions 子集）。
 
 职责（SRP）：把"用户文本 + 会话标识"翻译成对 Afterglow `/v1/chat/completions`
-的一次调用，并返回应当回复的文本；若 Afterglow 判定本轮应当沉默则返回 None。
+的一次调用，并返回应当回复的内容与 Afterglow 扩展字段；若 Afterglow 判定本轮
+应当沉默则返回 None。
 
 会话历史（辅助上下文）：
   Afterglow 后端虽然通过 `conversation_id` 在 LanceDB 维护 live memory，
@@ -60,6 +61,30 @@ class HistoryCompressionConfig:
     def enabled(self) -> bool:
         has_trigger = self.trigger_turns > 0 or self.trigger_tokens > 0
         return bool(self.api_key and self.model and has_trigger)
+
+
+@dataclass(frozen=True)
+class ScheduleTask:
+    """Afterglow schedule_tasks extension item."""
+
+    id: str
+    trigger_at: str
+    recurrence: str | None
+    message: str
+    title: str = ""
+    source: str = "extractor"
+
+
+@dataclass(frozen=True)
+class AfterglowReply:
+    """Afterglow visible reply content plus supported extension fields.
+
+    content is empty only when Afterglow is silent but still returned schedule_tasks.
+    """
+
+    content: str
+    reply_delay_seconds: float = 0.0
+    schedule_tasks: tuple[ScheduleTask, ...] = ()
 
 
 class LocalHistoryStore:
@@ -389,12 +414,14 @@ class AfterglowClient:
 
     # ---------------------------------------------------------------- chat
 
-    async def chat(self, *, conversation_id: str, user_text: str) -> str | None:
-        """单轮请求 Afterglow，返回需要发给用户的文本。
+    async def chat(
+        self, *, conversation_id: str, user_text: str
+    ) -> AfterglowReply | None:
+        """单轮请求 Afterglow，返回需要发给用户的内容。
 
         :param conversation_id: 稳定标识（同一 QQ 用户复用同一 ID，让后端维护记忆）
         :param user_text: 用户原文
-        :return: 回复文本；若判定沉默则返回 None
+        :return: 回复内容与扩展字段；若判定沉默则返回 None
         :raises AfterglowError: 网络/鉴权/协议错误
         """
         async with self._get_lock(conversation_id):
@@ -435,10 +462,10 @@ class AfterglowClient:
 
             reply = self._extract_reply(data)
 
-            # 仅在非沉默 / 非失败时把这一轮追加到历史
-            # 失败已通过抛异常短路，这里只需检查沉默
-            if reply is not None:
-                await self._append_history(conversation_id, user_text, reply)
+            # 仅在非沉默 / 非失败时把这一轮追加到历史。多条 QQ 气泡分发只发生在
+            # 调用方展示层；历史里保留完整 assistant content，维持 OpenAI 协议语义。
+            if reply is not None and reply.content:
+                await self._append_history(conversation_id, user_text, reply.content)
 
             return reply
 
@@ -490,7 +517,7 @@ class AfterglowClient:
 
     # --------------------------------------------------------------- parse
 
-    def _extract_reply(self, data: dict[str, Any]) -> str | None:
+    def _extract_reply(self, data: dict[str, Any]) -> AfterglowReply | None:
         """从 OpenAI 兼容响应中提取回复，识别 Afterglow 的沉默信号。
 
         沉默判断三选一（任一命中即视为沉默）：
@@ -502,6 +529,9 @@ class AfterglowClient:
         policy = data.get("policy") or {}
         if policy.get("should_reply") is False:
             logger.info("Afterglow 决策沉默：%s", policy.get("reason") or policy)
+            silent_reply = self._extract_silent_schedule_tasks(data)
+            if silent_reply is not None:
+                return silent_reply
             return None
 
         choices = data.get("choices") or []
@@ -523,15 +553,102 @@ class AfterglowClient:
         # 2. finish_reason
         if finish_reason == "silenced":
             logger.info("Afterglow finish_reason=silenced，跳过回复")
+            silent_reply = self._extract_silent_schedule_tasks(data)
+            if silent_reply is not None:
+                return silent_reply
             return None
 
         # 3. sentinel 字符串
         if content == self._silence_sentinel:
             logger.info("Afterglow 返回 sentinel %r，跳过回复", self._silence_sentinel)
+            silent_reply = self._extract_silent_schedule_tasks(data)
+            if silent_reply is not None:
+                return silent_reply
             return None
 
         if not content:
             # 非沉默但空内容：当作异常上抛，避免静默丢消息
             raise AfterglowError(f"Afterglow 返回空内容：{data}")
 
-        return content
+        return AfterglowReply(
+            content=content,
+            reply_delay_seconds=self._extract_reply_delay_seconds(data),
+            schedule_tasks=self._extract_schedule_tasks(data),
+        )
+
+    def _extract_silent_schedule_tasks(
+        self, data: dict[str, Any]
+    ) -> AfterglowReply | None:
+        schedule_tasks = self._extract_schedule_tasks(data)
+        if not schedule_tasks:
+            return None
+
+        logger.info("Afterglow 本轮沉默，但保留 %d 条 schedule_tasks", len(schedule_tasks))
+        return AfterglowReply(content="", schedule_tasks=schedule_tasks)
+
+    def _extract_reply_delay_seconds(self, data: dict[str, Any]) -> float:
+        policy = data.get("policy") or {}
+        raw_delay = policy.get("reply_delay_seconds", 0)
+        try:
+            delay = float(raw_delay)
+        except (TypeError, ValueError):
+            logger.warning("忽略非法 reply_delay_seconds=%r", raw_delay)
+            return 0.0
+        return max(0.0, delay)
+
+    def _extract_schedule_tasks(
+        self, data: dict[str, Any]
+    ) -> tuple[ScheduleTask, ...]:
+        raw_tasks = data.get("schedule_tasks")
+        if raw_tasks is None:
+            return ()
+        if not isinstance(raw_tasks, list):
+            logger.warning("忽略非法 schedule_tasks 字段：%r", raw_tasks)
+            return ()
+
+        tasks: list[ScheduleTask] = []
+        for raw_task in raw_tasks:
+            if not isinstance(raw_task, dict):
+                logger.warning("忽略非法 ScheduleTask：%r", raw_task)
+                continue
+
+            task_id = raw_task.get("id")
+            trigger_at = raw_task.get("trigger_at")
+            message = raw_task.get("message")
+            if not (
+                isinstance(task_id, str)
+                and task_id.strip()
+                and isinstance(trigger_at, str)
+                and trigger_at.strip()
+                and isinstance(message, str)
+                and message.strip()
+            ):
+                logger.warning("忽略缺少必填字段的 ScheduleTask：%r", raw_task)
+                continue
+
+            recurrence = raw_task.get("recurrence")
+            if recurrence is not None and not isinstance(recurrence, str):
+                logger.warning(
+                    "ScheduleTask recurrence 类型异常，按一次性任务处理：%r",
+                    raw_task,
+                )
+                recurrence = None
+
+            title = raw_task.get("title")
+            source = raw_task.get("source")
+            tasks.append(
+                ScheduleTask(
+                    id=task_id.strip(),
+                    trigger_at=trigger_at.strip(),
+                    recurrence=recurrence.strip() if recurrence else None,
+                    message=message.strip(),
+                    title=title.strip() if isinstance(title, str) else "",
+                    source=(
+                        source.strip()
+                        if isinstance(source, str) and source
+                        else "extractor"
+                    ),
+                )
+            )
+
+        return tuple(tasks)
