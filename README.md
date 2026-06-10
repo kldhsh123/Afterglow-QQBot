@@ -17,7 +17,8 @@ Afterglow-QQBot/
 ├── qqbot/                  
 │   ├── __init__.py
 │   ├── api.py              # REST：token / 发文本 / 发图
-│   └── gateway.py          # WebSocket：Hello/Identify/Heartbeat/Resume
+│   ├── gateway.py          # WebSocket：Hello/Identify/Heartbeat/Resume
+│   └── schedule_tasks.py   # Afterglow schedule_tasks → 本地 QQ 定时消息
 ├── afterglow_client.py     # Afterglow OpenAI 兼容客户端（SRP，仅 chat completions）
 ├── main.py                 # 粘合层：C2C 消息 → Afterglow → 回复
 ├── .env.example            # 配置模板
@@ -89,6 +90,12 @@ python main.py
 | `AFTERGLOW_HISTORY_COMPRESSION_KEEP_TURNS` | ❌ | `3` | 每次压缩后保留最近多少轮原文 |
 | `AFTERGLOW_HISTORY_COMPRESSION_TIMEOUT` | ❌ | `60` | 历史压缩 API 请求超时（秒） |
 | `AFTERGLOW_HISTORY_COMPRESSION_MAX_OUTPUT_TOKENS` | ❌ | `800` | 摘要最大输出 token |
+| `AFTERGLOW_SPLIT_ASSISTANT_MESSAGES` | ❌ | `true` | 按 assistant `content` 里的双换行拆成多条 QQ 气泡 |
+| `AFTERGLOW_MESSAGE_SEGMENT_MIN_DELAY` | ❌ | `1.5` | 多气泡分条时的最小段间延迟（秒） |
+| `AFTERGLOW_MESSAGE_SEGMENT_MAX_DELAY` | ❌ | `3.0` | 多气泡分条时的最大段间延迟（秒） |
+| `AFTERGLOW_SCHEDULE_TASKS_ENABLED` | ❌ | `true` | 是否消费 Afterglow 顶层 `schedule_tasks` 并注册 QQ 定时消息 |
+| `AFTERGLOW_SCHEDULE_DB_PATH` | ❌ | `data/schedule_tasks.sqlite3` | 本地定时任务 SQLite 路径；相对路径按项目目录解析 |
+| `AFTERGLOW_SCHEDULE_POLL_INTERVAL` | ❌ | `1.0` | 本地定时任务轮询间隔（秒） |
 | `AFTERGLOW_ERROR_REPLY` | ❌ | （空） | 调用失败时的兜底回复；留空则不回（更接近真人"没动静"） |
 | `AFTERGLOW_ALLOWED_OPENIDS` | ❌ | （空） | 逗号分隔的 user_openid 白名单；留空 = 任何人都能触发（启动时会 warning） |
 | `AFTERGLOW_DENIED_REPLY` | ❌ | （空） | 非白名单用户的回复；留空 = 静默丢弃（不暴露机器人存在） |

@@ -17,12 +17,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
+import re
 import signal
 import sys
 from pathlib import Path
 
 from afterglow_client import AfterglowClient, AfterglowError, HistoryCompressionConfig
 from qqbot import C2CMessage, QQBotAPI, QQBotGateway
+from qqbot.schedule_tasks import QQScheduleTaskRunner
 
 logger = logging.getLogger("afterglow.qqbot")
 
@@ -60,6 +63,59 @@ def _parse_openid_set(raw: str) -> set[str] | None:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def _parse_bool(raw: str, *, default: bool) -> bool:
+    raw = raw.strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _resolve_project_path(raw: str) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(__file__).parent / path
+    return path
+
+
+def _split_assistant_message(content: str) -> list[str]:
+    """Split assistant content into QQ/WeChat-style bubbles.
+
+    Afterglow uses two or more consecutive newlines as message separators.
+    Single newlines remain inside the same message bubble.
+    """
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    segments: list[str] = []
+    for segment in re.split(r"\n{2,}", normalized):
+        segment = segment.strip("\n")
+        if segment.strip():
+            segments.append(segment)
+    return segments
+
+
+async def _send_assistant_reply(
+    api: QQBotAPI,
+    *,
+    openid: str,
+    msg_id: str,
+    content: str,
+    split_messages: bool,
+    segment_delay_min: float,
+    segment_delay_max: float,
+) -> None:
+    if split_messages:
+        segments = _split_assistant_message(content)
+    else:
+        segments = [content]
+
+    if not segments:
+        return
+
+    for index, segment in enumerate(segments):
+        if index > 0:
+            await asyncio.sleep(random.uniform(segment_delay_min, segment_delay_max))
+        await api.send_c2c_text(openid, segment, msg_id=msg_id)
+
+
 async def main() -> int:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -80,9 +136,7 @@ async def main() -> int:
         "AFTERGLOW_HISTORY_DB_PATH",
         "data/chat_history.sqlite3",
     )
-    history_db_path = Path(history_db_raw)
-    if not history_db_path.is_absolute():
-        history_db_path = Path(__file__).parent / history_db_path
+    history_db_path = _resolve_project_path(history_db_raw)
     history_compression = HistoryCompressionConfig(
         api_key=os.environ.get("AFTERGLOW_HISTORY_COMPRESSION_API_KEY", "").strip(),
         model=os.environ.get("AFTERGLOW_HISTORY_COMPRESSION_MODEL", "").strip(),
@@ -109,6 +163,30 @@ async def main() -> int:
         os.environ.get("AFTERGLOW_ALLOWED_OPENIDS", "")
     )
     denied_reply = os.environ.get("AFTERGLOW_DENIED_REPLY", "").strip()
+    split_messages = _parse_bool(
+        os.environ.get("AFTERGLOW_SPLIT_ASSISTANT_MESSAGES", "true"),
+        default=True,
+    )
+    segment_delay_min = float(
+        os.environ.get("AFTERGLOW_MESSAGE_SEGMENT_MIN_DELAY", "1.5")
+    )
+    segment_delay_max = float(
+        os.environ.get("AFTERGLOW_MESSAGE_SEGMENT_MAX_DELAY", "3.0")
+    )
+    if segment_delay_min < 0:
+        segment_delay_min = 0.0
+    if segment_delay_max < segment_delay_min:
+        segment_delay_max = segment_delay_min
+    schedule_tasks_enabled = _parse_bool(
+        os.environ.get("AFTERGLOW_SCHEDULE_TASKS_ENABLED", "true"),
+        default=True,
+    )
+    schedule_db_path = _resolve_project_path(
+        os.environ.get("AFTERGLOW_SCHEDULE_DB_PATH", "data/schedule_tasks.sqlite3")
+    )
+    schedule_poll_interval = float(
+        os.environ.get("AFTERGLOW_SCHEDULE_POLL_INTERVAL", "1.0")
+    )
 
     if allowed_openids:
         logger.info("白名单已启用，允许 %d 个 openid", len(allowed_openids))
@@ -127,6 +205,14 @@ async def main() -> int:
         history_db_path=history_db_path,
         history_compression=history_compression,
     )
+    schedule_runner: QQScheduleTaskRunner | None = None
+    if schedule_tasks_enabled:
+        schedule_runner = QQScheduleTaskRunner(
+            api,
+            schedule_db_path,
+            poll_interval=schedule_poll_interval,
+        )
+        await schedule_runner.start()
 
     @gw.on_c2c_message
     async def on_c2c(msg: C2CMessage) -> None:
@@ -173,9 +259,28 @@ async def main() -> int:
             # Afterglow 决策沉默，不发任何消息
             return
 
+        if schedule_runner is not None:
+            await schedule_runner.add_tasks(msg.user_openid, reply.schedule_tasks)
+        elif reply.schedule_tasks:
+            logger.info(
+                "收到 %d 条 schedule_tasks，但 AFTERGLOW_SCHEDULE_TASKS_ENABLED=false，已忽略",
+                len(reply.schedule_tasks),
+            )
+
+        if not reply.content:
+            return
+
         try:
-            await api.send_c2c_text(
-                msg.user_openid, reply, msg_id=msg.message_id
+            if reply.reply_delay_seconds > 0:
+                await asyncio.sleep(reply.reply_delay_seconds)
+            await _send_assistant_reply(
+                api,
+                openid=msg.user_openid,
+                msg_id=msg.message_id,
+                content=reply.content,
+                split_messages=split_messages,
+                segment_delay_min=segment_delay_min,
+                segment_delay_max=segment_delay_max,
             )
         except Exception:
             logger.exception("发送 C2C 文本失败 openid=%s", msg.user_openid)
@@ -191,6 +296,8 @@ async def main() -> int:
     try:
         await gw.run()
     finally:
+        if schedule_runner is not None:
+            await schedule_runner.stop()
         await api.aclose()
         await afterglow.aclose()
 
