@@ -80,6 +80,7 @@ class QQBotGateway:
 
         self._stopping = asyncio.Event()
         self._reconnect_attempts = 0
+        self._handler_tasks: set[asyncio.Task[None]] = set()
 
     # ----------------------------------------------------------- 事件注册
 
@@ -108,6 +109,8 @@ class QQBotGateway:
                     await asyncio.wait_for(self._stopping.wait(), timeout=delay)
                 except asyncio.TimeoutError:
                     pass
+        if self._handler_tasks:
+            await asyncio.gather(*self._handler_tasks, return_exceptions=True)
 
     def stop(self) -> None:
         self._stopping.set()
@@ -231,7 +234,24 @@ class QQBotGateway:
             attachments=data.get("attachments") or [],
             raw=data,
         )
+        task = asyncio.create_task(self._run_c2c_handler(msg))
+        self._handler_tasks.add(task)
+        task.add_done_callback(self._on_c2c_handler_done)
+
+    async def _run_c2c_handler(self, msg: C2CMessage) -> None:
+        if self._c2c_handler is None:
+            return
         try:
             await self._c2c_handler(msg)
         except Exception:
             logger.exception("C2C handler 异常")
+
+    def _on_c2c_handler_done(self, task: asyncio.Task[None]) -> None:
+        self._handler_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            # _run_c2c_handler 已记录异常；这里兜底防止未取异常告警。
+            logger.exception("C2C handler task 异常")

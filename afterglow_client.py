@@ -87,6 +87,13 @@ class AfterglowReply:
     schedule_tasks: tuple[ScheduleTask, ...] = ()
 
 
+@dataclass(frozen=True)
+class AfterglowImage:
+    """Image input for OpenAI-compatible multimodal chat content."""
+
+    url: str
+
+
 class LocalHistoryStore:
     """SQLite-backed short-term chat history store."""
 
@@ -415,59 +422,117 @@ class AfterglowClient:
     # ---------------------------------------------------------------- chat
 
     async def chat(
-        self, *, conversation_id: str, user_text: str
+        self,
+        *,
+        conversation_id: str,
+        user_text: str,
+        images: list[AfterglowImage] | None = None,
+        caller_id: str | None = None,
+        client_message_id: str | None = None,
     ) -> AfterglowReply | None:
         """单轮请求 Afterglow，返回需要发给用户的内容。
 
         :param conversation_id: 稳定标识（同一 QQ 用户复用同一 ID，让后端维护记忆）
         :param user_text: 用户原文
+        :param images: 当前轮用户发送的图片。仅随当前请求发送，不写入本地历史。
+        :param caller_id: Afterglow 扩展字段；同一调用方的并发请求可互相取消/合并。
+        :param client_message_id: Afterglow 扩展字段；调用方生成的单条用户消息幂等 ID。
         :return: 回复内容与扩展字段；若判定沉默则返回 None
         :raises AfterglowError: 网络/鉴权/协议错误
         """
-        async with self._get_lock(conversation_id):
+        images = images or []
+        lock = self._get_lock(conversation_id)
+        async with lock:
             history = await self._prepare_history(conversation_id)
-            # OpenAI 标准 messages：历史 + 当前 user 消息
-            messages: list[dict[str, str]] = [
-                *history,
-                {"role": "user", "content": user_text},
-            ]
 
-            payload: dict[str, Any] = {
-                # model 字段 Afterglow 视为占位（实际用 .env 配的 CHAT_MODEL），但传一下兼容性更好
-                "model": self._model,
-                "messages": messages,
-                "stream": False,
-                "conversation_id": conversation_id,
-            }
-            headers = {
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            }
-            url = f"{self._base_url}/v1/chat/completions"
+        user_content = self._build_user_content(user_text, images)
+        # OpenAI 标准 messages：已完成回复的历史 + 当前这一条 user 消息。
+        # 未完成的旧用户气泡由 Afterglow 根据 caller_id/client_message_id 队列合并。
+        messages: list[dict[str, Any]] = [
+            *history,
+            {"role": "user", "content": user_content},
+        ]
 
-            try:
-                resp = await self._client.post(url, json=payload, headers=headers)
-            except httpx.HTTPError as exc:
-                raise AfterglowError(f"请求 Afterglow 失败：{exc}") from exc
+        payload: dict[str, Any] = {
+            # model 字段 Afterglow 视为占位（实际用 .env 配的 CHAT_MODEL），但传一下兼容性更好
+            "model": self._model,
+            "messages": messages,
+            "stream": False,
+            "conversation_id": conversation_id,
+        }
+        if caller_id:
+            payload["caller_id"] = caller_id
+        if client_message_id:
+            payload["client_message_id"] = client_message_id
 
-            if resp.status_code >= 400:
-                raise AfterglowError(
-                    f"Afterglow 返回 {resp.status_code}：{resp.text[:500]}"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{self._base_url}/v1/chat/completions"
+
+        try:
+            resp = await self._client.post(url, json=payload, headers=headers)
+        except httpx.HTTPError as exc:
+            raise AfterglowError(f"请求 Afterglow 失败：{exc}") from exc
+
+        if resp.status_code >= 400:
+            raise AfterglowError(
+                f"Afterglow 返回 {resp.status_code}：{resp.text[:500]}"
+            )
+
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise AfterglowError(f"Afterglow 响应非 JSON：{resp.text[:200]}") from exc
+
+        reply = self._extract_reply(data)
+
+        # 仅在非沉默 / 非失败时把这一轮追加到历史。多条 QQ 气泡分发只发生在
+        # 调用方展示层；历史里保留完整 assistant content，维持 OpenAI 协议语义。
+        if reply is not None and reply.content:
+            async with lock:
+                await self._append_history(
+                    conversation_id,
+                    self._build_history_user_text(user_text, images),
+                    reply.content,
                 )
 
-            try:
-                data = resp.json()
-            except ValueError as exc:
-                raise AfterglowError(f"Afterglow 响应非 JSON：{resp.text[:200]}") from exc
+        return reply
 
-            reply = self._extract_reply(data)
+    @staticmethod
+    def _build_user_content(
+        user_text: str,
+        images: list[AfterglowImage],
+    ) -> str | list[dict[str, Any]]:
+        text = user_text.strip()
+        if not images:
+            return text
 
-            # 仅在非沉默 / 非失败时把这一轮追加到历史。多条 QQ 气泡分发只发生在
-            # 调用方展示层；历史里保留完整 assistant content，维持 OpenAI 协议语义。
-            if reply is not None and reply.content:
-                await self._append_history(conversation_id, user_text, reply.content)
+        parts: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": text or "用户发送了图片/表情包，请根据图片内容自然回复。",
+            }
+        ]
+        for image in images:
+            if image.url:
+                parts.append({"type": "image_url", "image_url": {"url": image.url}})
+        return parts
 
-            return reply
+    @staticmethod
+    def _build_history_user_text(
+        user_text: str,
+        images: list[AfterglowImage],
+    ) -> str:
+        text = user_text.strip()
+        if not images:
+            return text
+
+        image_note = "[图片]" if len(images) == 1 else f"[图片 x{len(images)}]"
+        if text:
+            return f"{text}\n{image_note}"
+        return image_note
 
     async def _prepare_history(self, conversation_id: str) -> list[dict[str, str]]:
         """读取本地历史，并在需要时先压缩。"""
@@ -520,10 +585,11 @@ class AfterglowClient:
     def _extract_reply(self, data: dict[str, Any]) -> AfterglowReply | None:
         """从 OpenAI 兼容响应中提取回复，识别 Afterglow 的沉默信号。
 
-        沉默判断三选一（任一命中即视为沉默）：
+        沉默/取消判断：
           1. `policy.should_reply == false`（Afterglow 扩展字段，最权威）
           2. `choices[0].finish_reason == "silenced"`
-          3. content 文本等于 sentinel（默认 "[silent]"）
+          3. `choices[0].finish_reason == "cancelled"`（旧请求已被新请求取代）
+          4. content 文本等于 sentinel（默认 "[silent]"）
         """
         # 1. policy 顶层字段（最准确）
         policy = data.get("policy") or {}
@@ -556,6 +622,10 @@ class AfterglowClient:
             silent_reply = self._extract_silent_schedule_tasks(data)
             if silent_reply is not None:
                 return silent_reply
+            return None
+
+        if finish_reason == "cancelled":
+            logger.info("Afterglow finish_reason=cancelled，跳过旧请求回复")
             return None
 
         # 3. sentinel 字符串

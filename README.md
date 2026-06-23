@@ -79,6 +79,10 @@ python main.py
 | `AFTERGLOW_API_KEY` | ✅ | — | Afterglow 的 `XUWEN_API_KEY` |
 | `AFTERGLOW_MODEL` | ❌ | `afterglow` | 占位字段，后端实际用 `.env` 的 `CHAT_MODEL` |
 | `AFTERGLOW_TIMEOUT` | ❌ | `120` | 单次请求超时（秒） |
+| `AFTERGLOW_IMAGE_MAX_COUNT` | ❌ | `4` | 每条消息最多转发多少张用户图片给 Afterglow；`0` = 禁用图片转发 |
+| `AFTERGLOW_IMAGE_DOWNLOAD_TIMEOUT` | ❌ | `20` | 下载 QQ 图片附件的超时（秒） |
+| `AFTERGLOW_IMAGE_MAX_BYTES` | ❌ | `8388608` | 单张图片最大字节数；超过会跳过下载 |
+| `AFTERGLOW_IMAGE_FALLBACK_TO_URL` | ❌ | `true` | 图片下载失败时是否退回原始 QQ 图片 URL 发给 Afterglow |
 | `AFTERGLOW_SILENCE_SENTINEL` | ❌ | `[silent]` | 与后端 `SILENCE_RESPONSE_SENTINEL` 保持一致 |
 | `AFTERGLOW_HISTORY_MAX_TURNS` | ❌ | `6` | 客户端在 messages 数组里携带的最近轮数（一轮 = user+assistant）；`0` = 不携带 |
 | `AFTERGLOW_HISTORY_DB_PATH` | ❌ | `data/chat_history.sqlite3` | 本地短期聊天记录 SQLite 路径；相对路径按项目目录解析 |
